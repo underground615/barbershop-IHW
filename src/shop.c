@@ -48,24 +48,6 @@ long shop_random_range(Shop *shop, long min, long max) {
     uint64_t span = (uint64_t)((unsigned long)(max - min)) + 1u;
     return min + (long)((uint64_t)shop_random(shop) % span);
 }
-// начинаем стрижку посетителя
-static void start_haircut(Shop *shop, int barber_index, int id) {
-    Barber *barber = &shop->barbers[barber_index];
-    Customer *customer = &shop->customers[id - 1];
-    long duration = shop_random_range(shop, shop->haircut_min_ms, shop->haircut_max_ms);
-    // меняем состояние барбера
-    barber->is_busy = true;
-    barber->customer_id = id;
-    barber->finish_ms = shop->current_time_ms + duration;
-    barber->busy_ms += duration;
-    // меняем состояние посетителя
-    customer->state = CUSTOMER_IN_SERVICE;
-    customer->start_ms = shop->current_time_ms;
-    customer->finish_ms = barber->finish_ms;
-
-    shop->total_wait_ms += customer->start_ms - customer->arrival_ms;
-    shop_log(shop,"[%ld ms] Парикмахер %d начал стричь посетителя %d (длительность %ld ms)\n", shop->current_time_ms, barber->id, id, duration);
-}
 // инициализируем парикмахерскую
 bool shop_init(Shop *shop, const SimulationConfig *config) {
     if (!shop || !config || config->barber_count <= 0 ||
@@ -80,6 +62,17 @@ bool shop_init(Shop *shop, const SimulationConfig *config) {
     shop->haircut_min_ms = config->haircut_min_ms;
     shop->haircut_max_ms = config->haircut_max_ms;
     shop->strategy = config->strategy;
+    srand(config->seed);
+    // создаем мьютекс и общий семафор
+    if (pthread_mutex_init(&shop->mutex, NULL) != 0) {
+        return false;
+    }
+    shop->mutex_ready = true;
+    if (sem_init(&shop->arrived, 0, 0) != 0) {
+        shop_free(shop);
+        return false;
+    }
+    shop->arrived_ready = true;
     // память под парикмахеров
     shop->barbers = calloc((size_t)config->barber_count,sizeof(Barber));
     // памяь под посетителей
@@ -110,6 +103,28 @@ bool shop_init(Shop *shop, const SimulationConfig *config) {
     for (int i = 0; i < config->barber_count; ++i) {
         shop->barbers[i].id = i + 1;
         shop->barbers[i].customer_id = -1;
+        shop->barbers[i].shop = shop;
+        // барбер получает свой семафор
+        if (sem_init(&shop->barbers[i].wake, 0, 0) != 0) {
+            shop_free(shop);
+            return false;
+        }
+        shop->barber_sems++;
+    }
+    for (int i = 0; i < config->max_customers; ++i) {
+        Customer *customer = &shop->customers[i];
+        customer->id = i + 1;
+        customer->shop = shop;
+        if (sem_init(&customer->done, 0, 0) != 0) {
+            shop_free(shop);
+            return false;
+        }
+        if (sem_init(&customer->released, 0, 0) != 0) {
+            sem_destroy(&customer->done);
+            shop_free(shop);
+            return false;
+        }
+        shop->customer_sems++;
     }
     return true;
 }
@@ -120,6 +135,19 @@ void shop_free(Shop *shop) {
     }
     if (shop->log_fd >= 0) {
         close(shop->log_fd);
+    }
+    for (int i = 0; i < shop->barber_sems; ++i) {
+        sem_destroy(&shop->barbers[i].wake);
+    }
+    for (int i = 0; i < shop->customer_sems; ++i) {
+        sem_destroy(&shop->customers[i].done);
+        sem_destroy(&shop->customers[i].released);
+    }
+    if (shop->arrived_ready) {
+        sem_destroy(&shop->arrived);
+    }
+    if (shop->mutex_ready) {
+        pthread_mutex_destroy(&shop->mutex);
     }
     queue_free(&shop->queue);
     free(shop->barbers);
@@ -148,7 +176,9 @@ void shop_customer_arrive(Shop *shop, int id) {
     // ищем свободног барбера и начинаем стрижку
     int index = shop_find_free_barber(shop);
     if (index >= 0) {
-        start_haircut(shop, index, id);
+        shop->barbers[index].is_busy = true;
+        shop->barbers[index].customer_id = id;
+        sem_post(&shop->barbers[index].wake);
     } else if (queue_push(&shop->queue, id)) { // не нашли добавляем в очередь
         customer->state = CUSTOMER_WAITING;
         shop_log(shop,"[%ld ms] Посетитель %d ожидает. Очередь: %d/%d\n", shop->current_time_ms, id, shop->queue.size, shop->queue.capacity);
@@ -158,26 +188,23 @@ void shop_customer_arrive(Shop *shop, int id) {
         shop_log(shop, "[%ld ms] Посетитель %d ушёл: нет свободных мест\n", shop->current_time_ms, id);
     }
 }
-// завершаем стрижку посетителя
-void shop_finish_haircut(Shop *shop, int index) {
-    if (!shop || index < 0 || index >= shop->barbers_cnt) {
-        return;
-    }
-    Barber *barber = &shop->barbers[index];
-    if (!barber->is_busy || barber->finish_ms != shop->current_time_ms) {
-        return;
-    }
-    int id = barber->customer_id;
-    shop->customers[id - 1].state = CUSTOMER_SERVED;
-    shop->served_cnt++;
-    shop_log(shop, "[%ld ms] Парикмахер %d закончил стрижку посетителя %d\n", shop->current_time_ms, barber->id, id);
-    barber->is_busy = false;
-    barber->customer_id = -1;
-    barber->finish_ms = 0;
-    int next = queue_pop(&shop->queue, shop->strategy, shop_random(shop));
-    if (next >= 0) { // если нашли ожидающего
-        start_haircut(shop, index, next);
-    } else { // очередь была пуста
-        shop_log(shop,"[%ld ms] Парикмахер %d свободен\n", shop->current_time_ms, barber->id);
+
+// получение времени с начала работы
+long shop_time_ms(const Shop *shop) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long)((now.tv_sec - shop->started.tv_sec) * 1000
+        + (now.tv_nsec - shop->started.tv_nsec) / 1000000);
+}
+// Приостанавливаем текущий поток 
+void shop_sleep_ms(long ms) {
+    struct timespec delay = {ms / 1000, (ms % 1000) * 1000000};
+    nanosleep(&delay, NULL);
+}
+// ждем разрешение на семафоре (конец стрижки)
+void shop_wait(sem_t *semaphore) {
+    if (sem_wait(semaphore) != 0) {
+        fprintf(stderr, "Ошибка ожидания семафора\n");
+        exit(EXIT_FAILURE);
     }
 }

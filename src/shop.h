@@ -11,7 +11,11 @@ int shop_find_free_barber(const Shop *shop);
 
 void shop_customer_arrive(Shop *shop, int customer_id);
 
-void shop_finish_haircut(Shop *shop, int barber_index);
+long shop_time_ms(const Shop *shop);
+
+void shop_sleep_ms(long ms);
+
+void shop_wait(sem_t *semaphore);
 
 uint32_t shop_random(Shop *shop);
 

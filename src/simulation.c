@@ -1,75 +1,146 @@
 #include "simulation.h"
 #include "shop.h"
-#include <limits.h>
-#include <signal.h>
+#include "queue.h"
+#include <stdio.h>
+#include <string.h>
 
-static volatile sig_atomic_t interrupted = 0;
-// обрабатываем сигнал прерывания
-static void on_signal(int signum) {
-    (void)signum;
-    interrupted = 1;
+// поток посетителя
+static void *customer_run(void *arg) {
+    Customer *customer = arg;
+    Shop *shop = customer->shop;
+    pthread_mutex_lock(&shop->mutex);
+    shop->current_time_ms = shop_time_ms(shop);
+    shop_customer_arrive(shop, customer->id);
+    bool accepted = customer->state != CUSTOMER_LEFT;
+    pthread_mutex_unlock(&shop->mutex);
+    sem_post(&shop->arrived);
+    if (!accepted) {
+        return NULL;
+    }
+    shop_wait(&customer->done);
+    pthread_mutex_lock(&shop->mutex);
+    shop_log(shop, "[%ld ms] Посетитель %d освободил кресло и ушёл\n",
+             shop_time_ms(shop), customer->id);
+    pthread_mutex_unlock(&shop->mutex);
+    sem_post(&customer->released);
+    return NULL;
 }
-// ищем ближайшее завершение стрижки
-static long next_finish(const Shop *shop) {
-    long result = -1;
-    for (int i = 0; i < shop->barbers_cnt; ++i) {
-        if (shop->barbers[i].is_busy &&
-            (result < 0 || shop->barbers[i].finish_ms < result)) {
-            result = shop->barbers[i].finish_ms;
-        }
-    }
-    return result;
-}
-// запуск симуляции
-void simulation_run(Shop *shop, const SimulationConfig *config) {
-    if (!shop || !config) {
-        return;
-    }
-    interrupted = 0;
-    void (*old_int)(int) = signal(SIGINT, on_signal); // ручное завершение Ctrl+C
-    // генерируем время первого клиента
-    long arrival = -1;
-    if (config->max_customers > 0) {
-        arrival = shop_random_range(shop, config->arrival_min_ms, config->arrival_max_ms);
-    }
-    // успеет ли до закрытия первый клиент
-    if (arrival >= 0 && arrival > config->closing_ms) {
-        arrival = -1;
-    }
-    shop_log(shop, "=== Парикмахерская открылась ===\n");
-    while (!interrupted) {
-        long finish = next_finish(shop);
-        // нет клиентов и активных стрижек
-        if (arrival < 0 && finish < 0) {
+
+// поток парикмахера
+static void *barber_run(void *arg) {
+    Barber *barber = arg;
+    Shop *shop = barber->shop;
+    for (;;) {
+        pthread_mutex_lock(&shop->mutex);
+        if (!barber->is_busy && shop->closing) {
+            pthread_mutex_unlock(&shop->mutex);
             break;
         }
-        // финиш до пришедшего клиента
-        if (finish >= 0 && (arrival < 0 || finish <= arrival)) {
-            shop->current_time_ms = finish;
-            for (int i = 0; i < shop->barbers_cnt; ++i) {
-                if (shop->barbers[i].is_busy && shop->barbers[i].finish_ms == finish) {
-                    shop_finish_haircut(shop, i); // заканчиваем стрижки барберов которые заканчиваются сейчас
-                }
-            }
-        } else { // приход клиента
-            shop->current_time_ms = arrival;
-            shop_customer_arrive(shop, shop->customers_cnt + 1);
-            if (shop->customers_cnt == config->max_customers) {
-                arrival = -1; // больше клиенты не влезают
-            } else {
-                // время прихода следующего клиента
-                long delta = shop_random_range(shop, config->arrival_min_ms, config->arrival_max_ms);
-                if (delta > LONG_MAX - arrival || arrival + delta > config->closing_ms) {
-                    arrival = -1;
-                } else {
-                    arrival += delta;
-                }
-            }
+        if (!barber->is_busy) {
+            shop_log(shop, "[%ld ms] Парикмахер %d засыпает\n",
+                     shop_time_ms(shop), barber->id);
         }
+        pthread_mutex_unlock(&shop->mutex);
+        shop_wait(&barber->wake);
+        pthread_mutex_lock(&shop->mutex);
+        if (!barber->is_busy && shop->closing) {
+            pthread_mutex_unlock(&shop->mutex);
+            break;
+        }
+        shop_log(shop, "[%ld ms] Парикмахер %d проснулся\n",
+                 shop_time_ms(shop), barber->id);
+        while (barber->is_busy) {
+            Customer *customer = &shop->customers[barber->customer_id - 1];
+            long duration = shop_random_range(shop, shop->haircut_min_ms, shop->haircut_max_ms);
+            customer->state = CUSTOMER_IN_SERVICE;
+            customer->start_ms = shop_time_ms(shop);
+            shop->total_wait_ms += customer->start_ms - customer->arrival_ms;
+            shop_log(shop, "[%ld ms] Парикмахер %d пригласил посетителя %d к креслу\n",
+                     customer->start_ms, barber->id, customer->id);
+            shop_log(shop, "[%ld ms] Парикмахер %d начал стричь посетителя %d (длительность %ld ms)\n",
+                     customer->start_ms, barber->id, customer->id, duration);
+            pthread_mutex_unlock(&shop->mutex);
+            shop_sleep_ms(duration);
+            pthread_mutex_lock(&shop->mutex);
+            customer->finish_ms = shop_time_ms(shop);
+            customer->state = CUSTOMER_SERVED;
+            barber->busy_ms += customer->finish_ms - customer->start_ms;
+            shop->served_cnt++;
+            shop_log(shop, "[%ld ms] Парикмахер %d закончил стрижку посетителя %d\n",
+                     customer->finish_ms, barber->id, customer->id);
+            pthread_mutex_unlock(&shop->mutex);
+            sem_post(&customer->done);
+            shop_wait(&customer->released);
+            pthread_mutex_lock(&shop->mutex);
+            int next = queue_pop(&shop->queue, shop->strategy, shop_random(shop));
+            barber->customer_id = next;
+            barber->is_busy = next >= 0;
+        }
+        pthread_mutex_unlock(&shop->mutex);
     }
-    if (interrupted) {
-        shop_log(shop, "Симуляция прервана сигналом\n");
+    return NULL;
+}
+
+// запуск симуляции
+int simulation_run(Shop *shop, const SimulationConfig *config) {
+    int result = 0;
+    int barber_threads = 0;
+    int customer_threads = 0;
+    clock_gettime(CLOCK_MONOTONIC, &shop->started);
+    shop_log(shop, "=== Парикмахерская открылась ===\n");
+    // создаем потоки для парикмахеров
+    for (int i = 0; i < shop->barbers_cnt; ++i) {
+        int error = pthread_create(&shop->barbers[i].thread, NULL, barber_run, &shop->barbers[i]);
+        if (error != 0) {
+            fprintf(stderr, "pthread_create: %s\n", strerror(error));
+            result = 1;
+            break;
+        }
+        barber_threads++;
     }
+    // создаем потоки для посетителей
+    for (int i = 0; result == 0 && i < config->max_customers; ++i) {
+        pthread_mutex_lock(&shop->mutex);
+        long delay = shop_random_range(shop, config->arrival_min_ms, config->arrival_max_ms);
+        pthread_mutex_unlock(&shop->mutex);
+        long remaining = config->closing_ms - shop_time_ms(shop);
+        if (remaining <= 0) {
+            break;
+        }
+        if (delay > remaining) {
+            shop_sleep_ms(remaining);
+            break;
+        }
+        shop_sleep_ms(delay);
+        if (shop_time_ms(shop) >= config->closing_ms) {
+            break;
+        }
+        // создаем сам поток
+        int error = pthread_create(&shop->customers[i].thread, NULL, customer_run, &shop->customers[i]);
+        if (error != 0) {
+            fprintf(stderr, "pthread_create: %s\n", strerror(error));
+            result = 1;
+            break;
+        }
+        customer_threads++;
+        shop_wait(&shop->arrived);
+    }
+    pthread_mutex_lock(&shop->mutex);
+    shop_log(shop, "[%ld ms] Приём новых посетителей окончен\n", shop_time_ms(shop));
+    pthread_mutex_unlock(&shop->mutex);
+    for (int i = 0; i < customer_threads; ++i) {
+        pthread_join(shop->customers[i].thread, NULL);
+    }
+    pthread_mutex_lock(&shop->mutex);
+    shop->closing = true;
+    pthread_mutex_unlock(&shop->mutex);
+    for (int i = 0; i < barber_threads; ++i) {
+        sem_post(&shop->barbers[i].wake);
+    }
+    for (int i = 0; i < barber_threads; ++i) {
+        pthread_join(shop->barbers[i].thread, NULL);
+    }
+    shop->current_time_ms = shop_time_ms(shop);
     // выводим итоговую статистику
     shop_log(
         shop,
@@ -78,7 +149,7 @@ void simulation_run(Shop *shop, const SimulationConfig *config) {
         "Обслужено: %d\n"
         "Ушло: %d\n"
         "Осталось в очереди: %d\n"
-        "Время модели: %ld ms\n",
+        "Время работы: %ld ms\n",
         shop->customers_cnt,
         shop->served_cnt,
         shop->left_cnt,
@@ -99,5 +170,5 @@ void simulation_run(Shop *shop, const SimulationConfig *config) {
         }
         shop_log(shop, "Загрузка парикмахера %d: %.2f%%\n", i + 1, perc);
     }
-    signal(SIGINT, old_int);
+    return result;
 }

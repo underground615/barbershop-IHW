@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Не удалось создать парикмахерскую\n");
         return 1;
     }
-    simulation_run(&shop, &config);
+    int result = simulation_run(&shop, &config);
     shop_free(&shop);
-    return 0;
+    return result;
 }

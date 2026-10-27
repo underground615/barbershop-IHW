@@ -3,6 +3,6 @@
 
 #include "models.h"
 
-void simulation_run(Shop *shop, const SimulationConfig *config);
+int simulation_run(Shop *shop, const SimulationConfig *config);
 
 #endif //BARBERSHOP_SIMULATION_H

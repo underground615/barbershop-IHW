@@ -3,6 +3,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <time.h>
+
+typedef struct Shop Shop;
 
 // состояние посетителя: ждет, стрижется, обслужен, ушел.
 typedef enum {
@@ -26,6 +31,10 @@ typedef struct {
     long arrival_ms;
     long start_ms;
     long finish_ms;
+    Shop *shop;
+    pthread_t thread;
+    sem_t done;
+    sem_t released;
 } Customer;
 
 // сущность барбера
@@ -35,6 +44,9 @@ typedef struct {
     int customer_id;
     long finish_ms;
     long busy_ms;
+    Shop *shop;
+    pthread_t thread;
+    sem_t wake;
 } Barber;
 
 // очерель посетителей
@@ -60,7 +72,7 @@ typedef struct {
 } SimulationConfig;
 
 // состояние симуляции барбершопа
-typedef struct {
+struct Shop {
     Barber *barbers;
     Customer *customers;
     Queue queue;
@@ -75,6 +87,14 @@ typedef struct {
     long haircut_max_ms;
     QueueStrategy strategy;
     int log_fd;
-} Shop;
+    pthread_mutex_t mutex;
+    sem_t arrived;
+    bool mutex_ready;
+    bool arrived_ready;
+    int barber_sems;
+    int customer_sems;
+    bool closing;
+    struct timespec started;
+};
 
 #endif
